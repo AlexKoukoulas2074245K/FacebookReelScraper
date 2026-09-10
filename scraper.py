@@ -1,0 +1,1164 @@
+from playwright.sync_api import sync_playwright
+from pathlib import Path
+from datetime import date, datetime, timedelta
+from decimal import Decimal, ROUND_HALF_UP
+from collections import defaultdict
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Alignment
+from openpyxl.chart import BarChart, Reference
+from openpyxl.chart.axis import DateAxis
+from openpyxl.styles import Font
+from copy import copy
+
+import random
+import re
+
+HEADERS = [
+    "Date",
+    "Reel Name",
+    "View Count",
+    "Net Follows",
+    "Engagement",
+    "3-Second Views"
+]
+
+def format_numbers(filename):
+
+    wb = load_workbook(filename)
+    ws = wb.active
+
+    # Apply comma formatting to:
+    # Column C = View Count
+    # Column D = Net Follows
+
+    for row in range(2, ws.max_row + 1):
+
+        ws.cell(row, 3).number_format = '#,##0'
+        ws.cell(row, 4).number_format = '#,##0'
+
+    wb.save(filename)
+
+def format_alignment(filename):
+
+    wb = load_workbook(filename)
+    ws = wb.active
+
+    center = Alignment(horizontal="center")
+
+    # Center columns A:F
+    for row in range(1, ws.max_row + 1):
+        for col in range(1, 7):
+            ws.cell(row, col).alignment = center
+
+    wb.save(filename)
+
+def sort_workbook(filename):
+
+    wb = load_workbook(filename)
+    ws = wb.active
+    
+    current_scan_time = ws["Q2"].value
+    previous_scan_time = ws["Q3"].value
+    
+    print(f"Sorting workbook")
+     
+    # Read all rows except the header
+    rows = []
+
+    for row in ws.iter_rows(min_row=2, max_col=6, values_only=True):
+        if row[0] is not None:
+            rows.append(row)
+
+    #
+    # Sort by:
+    #   1. Date descending
+    #   2. Reel name ascending (keeps today's reels grouped nicely)
+    #
+    rows.sort(
+        key=lambda r: (
+            datetime.fromisoformat(str(r[0])),
+            r[1]
+        ),
+        reverse=True
+    )
+
+    #
+    # Rewrite the worksheet
+    #
+
+    # Delete everything except header
+    ws.delete_rows(2, ws.max_row)
+
+    # Add back in sorted order
+    for row in rows:
+        ws.append(row)
+
+
+    ws["Q2"] = current_scan_time
+    ws["Q3"] = previous_scan_time
+        
+    wb.save(filename)
+
+
+def create_graphs_sheet(filename):
+    wb = load_workbook(filename)
+
+    if "Graphs" in wb.sheetnames:
+        del wb["Graphs"]
+
+    ws = wb.create_sheet("Graphs")
+    print(f"Creating Graphs")
+     
+    # ------------------------------------------------------------------
+    # Collect raw cumulative data from the first sheet
+    # ------------------------------------------------------------------
+    source_ws = wb[wb.sheetnames[0]]
+
+    reels = defaultdict(list)
+
+    for row in range(2, source_ws.max_row + 1):
+        date_value = source_ws.cell(row, 1).value
+        reel_name = source_ws.cell(row, 2).value
+
+        if not date_value or not reel_name:
+            continue
+
+        views = source_ws.cell(row, 3).value
+        follows = source_ws.cell(row, 4).value
+        revenue = source_ws.cell(row, 6).value
+
+        # Convert datetime to date
+        if isinstance(date_value, datetime):
+            date_value = date_value.date()
+
+        # Convert views
+        try:
+            views = int(str(views).replace(",", ""))
+        except Exception:
+            views = 0
+
+        # Convert follows
+        try:
+            follows = int(str(follows).replace(",", ""))
+        except Exception:
+            follows = 0
+
+        # Convert revenue
+        try:
+            revenue = Decimal(
+                str(revenue)
+                .replace(",", "")
+                .replace("$", "")
+            )
+        except Exception:
+            revenue = Decimal("0")
+
+        reels[reel_name].append({
+            "date": date_value,
+            "views": views,
+            "follows": follows,
+            "revenue": revenue
+        })
+
+    # ------------------------------------------------------------------
+    # Page title
+    # ------------------------------------------------------------------
+    ws["A1"] = "REEL PERFORMANCE GRAPHS"
+    ws["A1"].font = copy(source_ws["A1"].font)
+    ws["A1"].alignment = Alignment(horizontal="center")
+
+    # ------------------------------------------------------------------
+    # Calculate daily differences
+    # ------------------------------------------------------------------
+    def calculate_daily_data(rows):
+
+        rows = sorted(rows, key=lambda x: x["date"])
+
+        # If there is more than one snapshot for a Reel on the same date,
+        # retain the latest one.
+        by_date = {}
+
+        for row in rows:
+            by_date[row["date"]] = row
+
+        rows = [
+            by_date[d]
+            for d in sorted(by_date.keys())
+        ]
+
+        daily = []
+
+        for i in range(1, len(rows)):
+            previous = rows[i - 1]
+            current = rows[i]
+
+            daily.append({
+                "date": current["date"],
+                "views": current["views"] - previous["views"],
+                "follows": current["follows"] - previous["follows"],
+                "revenue": current["revenue"] - previous["revenue"]
+            })
+
+        return daily
+
+    # ------------------------------------------------------------------
+    # Layout
+    #
+    # Reel name gets its own row.
+    #
+    # Charts:
+    #   Views       -> A
+    #   Net Follows -> L
+    #   Revenue     -> W
+    #
+    # Helper data is moved much farther right so it cannot overlap
+    # the visible charts.
+    # ------------------------------------------------------------------
+    graph_row = 3
+    helper_start_col = 100  # CV
+
+    for reel_index, reel_name in enumerate(sorted(reels.keys())):
+
+        raw_rows = reels[reel_name]
+
+        if len(raw_rows) < 2:
+            continue
+
+        daily_rows = calculate_daily_data(raw_rows)
+
+        if not daily_rows:
+            continue
+
+        # --------------------------------------------------------------
+        # Limit graphs to the most recent 15 daily entries.
+        #
+        # daily_rows is chronological, so this keeps the last 15 days
+        # available in the data (i.e. the most recent 15 days).
+        # --------------------------------------------------------------
+        daily_rows = daily_rows[-15:]
+
+        # --------------------------------------------------------------
+        # Reel name
+        # --------------------------------------------------------------
+        title_row = graph_row
+
+        ws.cell(title_row, 1).value = reel_name
+        ws.cell(title_row, 1).font = copy(source_ws["A1"].font)
+        ws.cell(title_row, 1).alignment = Alignment(
+            horizontal="left"
+        )
+
+        # --------------------------------------------------------------
+        # Helper data gets its own unique columns
+        # --------------------------------------------------------------
+        reel_helper_col = helper_start_col + (reel_index * 4)
+
+        date_col = reel_helper_col
+        views_col = reel_helper_col + 1
+        follows_col = reel_helper_col + 2
+        revenue_col = reel_helper_col + 3
+
+        helper_header_row = title_row + 1
+        data_start_row = helper_header_row + 1
+
+        # Headers
+        ws.cell(helper_header_row, date_col).value = "Date"
+        ws.cell(helper_header_row, views_col).value = "Views"
+        ws.cell(helper_header_row, follows_col).value = "Net Follows"
+        ws.cell(helper_header_row, revenue_col).value = "Revenue"
+
+        # Data
+        for data_row, daily in enumerate(
+            daily_rows,
+            start=data_start_row
+        ):
+            ws.cell(data_row, date_col).value = daily["date"]
+            ws.cell(data_row, date_col).number_format = "yyyy-mm-dd"
+
+            ws.cell(data_row, views_col).value = daily["views"]
+            ws.cell(data_row, follows_col).value = daily["follows"]
+            ws.cell(data_row, revenue_col).value = float(
+                daily["revenue"]
+            )
+
+        data_end_row = data_start_row + len(daily_rows) - 1
+
+        # --------------------------------------------------------------
+        # Views chart
+        # --------------------------------------------------------------
+        views_chart = BarChart()
+        views_chart.type = "col"
+        views_chart.visible_cells_only = False
+        views_chart.style = 10
+        views_chart.title = "Daily Views"
+        views_chart.y_axis.title = "Views"
+        views_chart.x_axis.title = "Date"
+        views_chart.height = 7
+        views_chart.width = 15
+        views_chart.legend = None
+
+        views_data = Reference(
+            ws,
+            min_col=views_col,
+            min_row=helper_header_row,
+            max_row=data_end_row
+        )
+
+        views_categories = Reference(
+            ws,
+            min_col=date_col,
+            min_row=data_start_row,
+            max_row=data_end_row
+        )
+
+        views_chart.add_data(
+            views_data,
+            titles_from_data=True
+        )
+
+        views_chart.set_categories(
+            views_categories
+        )
+
+        # --------------------------------------------------------------
+        # Net Follows chart
+        # --------------------------------------------------------------
+        follows_chart = BarChart()
+        follows_chart.type = "col"
+        follows_chart.visible_cells_only = False
+        follows_chart.style = 10
+        follows_chart.title = "Daily Net Follows"
+        follows_chart.y_axis.title = "Net Follows"
+        follows_chart.x_axis.title = "Date"
+        follows_chart.height = 7
+        follows_chart.width = 15
+        follows_chart.legend = None
+
+        follows_data = Reference(
+            ws,
+            min_col=follows_col,
+            min_row=helper_header_row,
+            max_row=data_end_row
+        )
+
+        follows_categories = Reference(
+            ws,
+            min_col=date_col,
+            min_row=data_start_row,
+            max_row=data_end_row
+        )
+
+        follows_chart.add_data(
+            follows_data,
+            titles_from_data=True
+        )
+
+        follows_chart.set_categories(
+            follows_categories
+        )
+
+        # --------------------------------------------------------------
+        # Revenue chart
+        # --------------------------------------------------------------
+        revenue_chart = BarChart()
+        revenue_chart.type = "col"
+        revenue_chart.visible_cells_only = False
+        revenue_chart.style = 10
+        revenue_chart.title = "Daily Revenue"
+        revenue_chart.y_axis.title = "Revenue"
+        revenue_chart.x_axis.title = "Date"
+        revenue_chart.height = 7
+        revenue_chart.width = 15
+        revenue_chart.legend = None
+
+        revenue_data = Reference(
+            ws,
+            min_col=revenue_col,
+            min_row=helper_header_row,
+            max_row=data_end_row
+        )
+
+        revenue_categories = Reference(
+            ws,
+            min_col=date_col,
+            min_row=data_start_row,
+            max_row=data_end_row
+        )
+
+        revenue_chart.add_data(
+            revenue_data,
+            titles_from_data=True
+        )
+
+        revenue_chart.set_categories(
+            revenue_categories
+        )
+
+        # --------------------------------------------------------------
+        # Put the three charts BELOW the Reel name
+        # --------------------------------------------------------------
+        chart_row = title_row + 2
+
+        ws.add_chart(
+            views_chart,
+            f"A{chart_row}"
+        )
+
+        ws.add_chart(
+            follows_chart,
+            f"L{chart_row}"
+        )
+
+        ws.add_chart(
+            revenue_chart,
+            f"W{chart_row}"
+        )
+
+        # --------------------------------------------------------------
+        # Leave enough vertical space before the next Reel
+        # --------------------------------------------------------------
+        graph_row += 17
+
+    # ------------------------------------------------------------------
+    # Hide helper columns
+    # ------------------------------------------------------------------
+    max_helper_col = helper_start_col + (
+        max(len(reels), 1) * 4
+    ) - 1
+
+    for col in range(helper_start_col, max_helper_col + 1):
+        ws.column_dimensions[
+            ws.cell(1, col).column_letter
+        ].hidden = True
+
+    # ------------------------------------------------------------------
+    # General formatting
+    # ------------------------------------------------------------------
+
+    wb.save(filename)
+
+def build_delta_summary(filename):
+
+    wb = load_workbook(filename)
+    ws = wb.active
+
+    
+    total_current_views = 0
+    total_previous_views = 0
+
+    total_current_follows = 0
+    total_previous_follows = 0
+
+    total_current_revenue = 0.0
+    total_previous_revenue = 0.0
+
+    #
+    # Find the latest date in column A
+    #
+
+    dates = []
+
+    for row in range(2, ws.max_row + 1):
+
+        value = ws.cell(row, 1).value
+
+        if value is None:
+            continue
+
+        try:
+            if isinstance(value, datetime):
+                row_date = value.date()
+            else:
+                row_date = datetime.fromisoformat(str(value)).date()
+
+            dates.append(row_date)
+
+        except ValueError:
+            continue
+
+    if not dates:
+        return
+
+    latest_date = max(dates)
+
+    print(f"Building summary for latest date: {latest_date}")
+
+    #
+    # Only process rows belonging to the latest date
+    #
+
+    for row in range(2, ws.max_row + 1):
+
+        value = ws.cell(row, 1).value
+
+        if value is None:
+            continue
+
+        try:
+            if isinstance(value, datetime):
+                row_date = value.date()
+            else:
+                row_date = datetime.fromisoformat(str(value)).date()
+
+        except ValueError:
+            continue
+
+        # Ignore all historical rows
+        if row_date != latest_date:
+            continue
+
+        view_delta = ws.cell(row, 8).value       # H
+        follow_delta = ws.cell(row, 9).value     # I
+        revenue_delta = ws.cell(row, 10).value   # J
+
+        #
+        # ----------------------------------------
+        # VIEW DELTA
+        # ----------------------------------------
+        #
+
+        if view_delta:
+
+            text = str(view_delta)
+
+            # Current + previous
+            match = re.search(
+                r"([+-]?\d+)\s*\(prev\s*([+-]?\d+)\)",
+                text
+            )
+
+            if match:
+
+                current = int(match.group(1))
+                previous = int(match.group(2))
+
+                total_current_views += current
+                total_previous_views += previous
+
+            else:
+
+                # Current only
+                match = re.search(
+                    r"([+-]?\d+)",
+                    text
+                )
+
+                if match:
+                    total_current_views += int(match.group(1))
+
+        else:
+
+            # No delta = brand new reel today
+            view_count = ws.cell(row, 3).value
+
+            if view_count is not None:
+                total_current_views += int(view_count)
+
+        #
+        # ----------------------------------------
+        # NET FOLLOWS DELTA
+        # ----------------------------------------
+        #
+
+        if follow_delta:
+
+            text = str(follow_delta)
+
+            # Current + previous
+            match = re.search(
+                r"([+-]?\d+)\s*\(prev\s*([+-]?\d+)\)",
+                text
+            )
+
+            if match:
+
+                current = int(match.group(1))
+                previous = int(match.group(2))
+
+                total_current_follows += current
+                total_previous_follows += previous
+
+            else:
+
+                # Current only
+                match = re.search(
+                    r"([+-]?\d+)",
+                    text
+                )
+
+                if match:
+                    total_current_follows += int(match.group(1))
+
+        else:
+
+            # No delta = brand new reel today
+            net_follows = ws.cell(row, 4).value
+
+            if net_follows is not None:
+                total_current_follows += int(net_follows)
+
+        #
+        # ----------------------------------------
+        # REVENUE DELTA
+        # ----------------------------------------
+        #
+
+        if revenue_delta:
+
+            text = str(revenue_delta)
+
+            # Current + previous
+            match = re.search(
+                r"(\$?[+-]?\d+(?:\.\d+)?)\s*\(prev\s*(\$?[+-]?\d+(?:\.\d+)?)\)",
+                text
+            )
+
+            if match:
+
+                current = float(
+                    match.group(1).replace("$", "").replace(",", "")
+                )
+
+                previous = float(
+                    match.group(2).replace("$", "").replace(",", "")
+                )
+
+                total_current_revenue += current
+                total_previous_revenue += previous
+
+            else:
+
+                # Current only
+                match = re.search(
+                    r"\$?([+-]?\d+(?:\.\d+)?)",
+                    text
+                )
+
+                if match:
+                    total_current_revenue += float(match.group(1))
+
+        else:
+
+            # No delta = brand new reel today
+            revenue = ws.cell(row, 6).value
+
+            if revenue is not None:
+
+                revenue_text = (
+                    str(revenue)
+                    .replace("$", "")
+                    .replace(",", "")
+                )
+
+                try:
+                    total_current_revenue += float(revenue_text)
+                except ValueError:
+                    pass
+
+    #
+    # Write aggregate results
+    #
+
+    ws["L1"] = "View Delta Difference"
+    ws["M1"] = "Net Follows Delta Difference"
+    ws["N1"] = "Revenue Delta Difference"
+    ws["P2"] = "Current Scan Time"
+    ws["P3"] = "Previous Scan Time"
+    ws["P2"].font = Font(bold=True)
+    ws["P3"].font = Font(bold=True)
+
+    # Swap scan times (previous scan time replaced only if previous yy-mm-dd != current yy-mm-dd
+    cell_time = ws.cell(2,17).value
+    if cell_time.split()[0] != datetime.now().strftime("%Y-%m-%d"):
+        ws["Q3"] = cell_time
+
+    ws["Q2"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+    
+    
+    #
+    # Determine trends
+    #
+    total_views_trend = "⚪"
+
+    if total_current_views > 2 * total_previous_views and total_previous_views > 0:
+        total_views_trend = "🔵"
+    elif total_current_views > total_previous_views:
+        total_views_trend = "🟢"
+    elif total_current_views < total_previous_views:
+        total_views_trend = "🔴"
+
+
+    total_follows_trend = "⚪"
+
+    if total_current_follows > 2 * total_previous_follows and total_previous_follows > 0:
+        total_follows_trend = "🔵"
+    elif total_current_follows > total_previous_follows:
+        total_follows_trend = "🟢"
+    elif total_current_follows < total_previous_follows:
+        total_follows_trend = "🔴"
+
+
+    total_revenue_trend = "⚪"
+
+    if total_current_revenue > 2 * total_previous_revenue and total_previous_revenue > 0:
+        total_revenue_trend = "🔵"
+    elif Decimal(total_current_revenue).quantize(Decimal("0.01")) > Decimal(total_previous_revenue).quantize(Decimal("0.01")):
+        total_revenue_trend = "🟢"
+    elif Decimal(total_current_revenue).quantize(Decimal("0.01")) < Decimal(total_previous_revenue).quantize(Decimal("0.01")):
+        total_revenue_trend = "🔴"
+
+    #
+    # Write summary cells
+    #
+
+    ws["L2"] = (
+        f"{total_views_trend} "
+        f"current {total_current_views:,} "
+        f"vs prev {total_previous_views:,}"
+    )
+
+    ws["M2"] = (
+        f"{total_follows_trend} "
+        f"current {total_current_follows:,} "
+        f"vs prev {total_previous_follows:,}"
+    )
+
+    ws["N2"] = (
+        f"{total_revenue_trend} "
+        f"current ${total_current_revenue:,.2f} "
+        f"vs prev ${total_previous_revenue:,.2f}"
+    )
+
+    #
+    # Formatting
+    #
+
+    center = Alignment(
+        horizontal="center",
+        vertical="center",
+        wrap_text=True
+    )
+
+    ws["L2"].alignment = center
+    ws["M2"].alignment = center
+    ws["N2"].alignment = center
+    ws["P2"].alignment = center
+    ws["P3"].alignment = center
+    ws["Q2"].alignment = center
+    ws["Q3"].alignment = center
+
+    ws.column_dimensions["L"].width = 35
+    ws.column_dimensions["M"].width = 35
+    ws.column_dimensions["N"].width = 35
+
+    wb.save(filename)
+    
+def rebuild_delta_table(filename):
+
+    wb = load_workbook(filename)
+    ws = wb.active
+
+    #
+    # Clear previous table
+    #
+
+    print(f"Rebuilding delta table")
+     
+    ws["H1"] = "View Delta"
+    ws["I1"] = "Net Follows Delta"
+    ws["J1"] = "Revenue Delta"
+
+    for row in range(2, ws.max_row + 1):
+        ws[f"H{row}"] = None
+        ws[f"I{row}"] = None
+        ws[f"J{row}"] = None
+
+    #
+    # Group rows by reel
+    #
+
+    reels = defaultdict(list)
+
+    for row in range(2, ws.max_row + 1):
+
+        reel = ws.cell(row, 2).value
+
+        if reel is None:
+            continue
+
+        revenue = ws.cell(row, 6).value
+
+        # Convert "$12.34" -> 12.34 for calculations
+        if isinstance(revenue, str):
+            revenue = float(
+                revenue.replace("$", "")
+                       .replace(",", "")
+                       .strip()
+            )
+
+        reels[reel].append({
+            "row": row,
+            "date": datetime.fromisoformat(str(ws.cell(row, 1).value)),
+            "views": ws.cell(row, 3).value,
+            "follows": ws.cell(row, 4).value,
+            "revenue": revenue
+        })
+
+    #
+    # Calculate latest delta for each reel
+    #
+
+    for reel, rows in reels.items():
+
+        rows.sort(key=lambda r: r["date"])
+
+        if len(rows) < 2:
+            continue
+
+        latest = rows[-1]
+        prev = rows[-2]
+
+        #
+        # Current deltas
+        #
+
+        view_delta = latest["views"] - prev["views"]
+        follow_delta = latest["follows"] - prev["follows"]
+        revenue_delta = latest["revenue"] - prev["revenue"]
+
+        view_text = f"{view_delta:+d}"
+        follow_text = f"{follow_delta:+d}"
+        revenue_text = f"${revenue_delta:+.2f}"
+
+        #
+        # If we have three days of data,
+        # calculate previous deltas and compare them
+        #
+
+        if len(rows) >= 3:
+
+            prev2 = rows[-3]
+
+            prev_view_delta = prev["views"] - prev2["views"]
+            prev_follow_delta = prev["follows"] - prev2["follows"]
+            prev_revenue_delta = prev["revenue"] - prev2["revenue"]
+
+            #
+            # Determine trend emoji
+            #
+
+            view_trend = "⚪"
+            follow_trend = "⚪"
+            revenue_trend = "⚪"
+
+            if view_delta != prev_view_delta:
+                if view_delta > 2 * prev_view_delta and prev_view_delta > 0:
+                    view_trend = "🔵"
+                else:
+                    view_trend = (
+                        "🟢"
+                        if view_delta > prev_view_delta
+                        else "🔴"
+                    )
+
+            if follow_delta != prev_follow_delta:
+                if follow_delta > 2 * prev_follow_delta and prev_follow_delta > 0:
+                    follow_trend = "🔵"
+                else:
+                    follow_trend = (
+                        "🟢"
+                        if follow_delta > prev_follow_delta
+                        else "🔴"
+                    )
+
+            if revenue_delta != prev_revenue_delta:
+                if revenue_delta > 2 * prev_revenue_delta and prev_revenue_delta > 0:
+                    revenue_trend = "🔵"
+                else:
+                    if Decimal(revenue_delta).quantize(Decimal("0.01")) > Decimal(prev_revenue_delta).quantize(Decimal("0.01")):
+                        revenue_trend = "🟢"
+                    elif Decimal(prev_revenue_delta).quantize(Decimal("0.01")) > Decimal(revenue_delta).quantize(Decimal("0.01")):
+                        revenue_trend = "🔴"
+
+            #
+            # Build final text
+            #
+
+            view_text = (
+                f" {view_trend} "
+                + view_text
+                + f" (prev {prev_view_delta:+d})"
+            )
+
+            follow_text = (
+                f" {follow_trend} "
+                + follow_text
+                + f" (prev {prev_follow_delta:+d})"
+            )
+
+            revenue_text = (
+                f" {revenue_trend} "
+                + revenue_text
+                + f" (prev ${prev_revenue_delta:+.2f})"
+            )
+
+        #
+        # Write onto latest row only
+        #
+
+        ws.cell(latest["row"], 8).value = view_text
+        ws.cell(latest["row"], 9).value = follow_text
+        ws.cell(latest["row"], 10).value = revenue_text
+
+    wb.save(filename)
+    
+def open_workbook(filename):
+    """Create workbook if it doesn't exist."""
+
+    if Path(filename).exists():
+        wb = load_workbook(filename)
+        ws = wb.active
+    else:
+        wb = Workbook()
+        ws = wb.active
+        ws.append(HEADERS)
+        wb.save(filename)
+
+    return wb, ws
+
+
+def batch_update_rows(filename, rows_to_update):
+    """
+    Update/add all scraped rows in a single workbook session.
+
+    rows_to_update should contain:
+        [date, reel_name, views, net_follows, engagement, three_second_views]
+    """
+
+    wb, ws = open_workbook(filename)
+    
+    # Build an index of existing rows once.
+    # Key = (date, reel_name)
+    existing_rows = {}
+
+    for row in range(2, ws.max_row + 1):
+        date_value = ws.cell(row, 1).value
+        reel_name = ws.cell(row, 2).value
+
+        key = (str(date_value), reel_name)
+        existing_rows[key] = row
+
+    # Now update/add everything without repeatedly searching the sheet
+    for row_data in rows_to_update:
+        row_date, reel_name, views, net_follows, engagement, three_second_views = row_data
+
+        key = (str(row_date), reel_name)
+
+        if key in existing_rows:
+            row = existing_rows[key]
+
+            ws.cell(row, 3).value = views
+            ws.cell(row, 4).value = net_follows
+            ws.cell(row, 5).value = engagement
+            ws.cell(row, 6).value = three_second_views
+
+            print(f"Updated {reel_name} ({row_date})")
+
+        else:
+            ws.append([
+                row_date,
+                reel_name,
+                views,
+                net_follows,
+                engagement,
+                three_second_views
+            ])
+
+            # Add the newly created row to the index in case
+            # the same reel/date appears again in this batch.
+            existing_rows[key] = ws.max_row
+
+            print(f"Added {reel_name} ({row_date})")
+
+    # ONE Excel save for the entire batch
+    wb.save(filename)
+
+
+def find_reels_scroll_container(page):
+
+    elements = page.locator("*")
+
+    candidates = []
+
+    for i in range(elements.count()):
+
+        try:
+            el = elements.nth(i)
+
+            dimensions = el.evaluate("""
+            e => ({
+                scrollHeight: e.scrollHeight,
+                clientHeight: e.clientHeight
+            })
+            """)
+
+            difference = (
+                dimensions["scrollHeight"]
+                - dimensions["clientHeight"]
+            )
+
+            if difference > 300:
+                candidates.append(
+                    (difference, el)
+                )
+
+        except:
+            pass
+
+    candidates.sort(
+        key=lambda x: x[0],
+        reverse=True
+    )
+
+    return candidates[0][1]
+
+def scroll_container(container):
+    previous_height = 0
+    same_count = 0
+
+    while True:
+
+        height = container.evaluate(
+            "(e) => e.scrollHeight"
+        )
+
+        print("Container height:", height)
+
+        if height == previous_height:
+            same_count += 1
+        else:
+            same_count = 0
+
+        if same_count >= 3:
+            break
+
+        container.evaluate(
+            "(e) => e.scrollTop = e.scrollHeight"
+        )
+
+        page.wait_for_timeout(3000)
+
+        previous_height = height
+
+    
+URL = "https://www.facebook.com/professional_dashboard/content/content_library/?date_range=LIFETIME&filter=PUBLISHED&post_type=ALL_CONTENT&post_types[0]=REELS&post_types[1]=PHOTOS&sort_by=DATE&sorting_method=METRICS_DESCENDING&locale=en_GB"
+today = datetime.now().date()
+noon_time = datetime.combine(today, datetime.strptime("12:00", "%H:%M").time())
+out_of_hours = datetime.now() < noon_time - timedelta(hours=1) or datetime.now() > noon_time + timedelta(hours=1)
+
+if out_of_hours:
+    answer = input("More than an hour away from 12:00 pm. Proceed (Y/N)?\n")
+    if answer.upper() == "N" or answer.upper() == "NO":
+        exit(0)
+
+with sync_playwright() as p:
+
+    browser = p.chromium.launch_persistent_context(
+        "/Users/Code/FacebookReelScraper/auth/facebook_profile",
+        headless=False
+    )
+
+    page = browser.new_page()
+
+    page.goto(URL)
+
+    input("Press ENTER once you're ready for scraping to begin...")
+    
+    # container = find_reels_scroll_container(page)+ 
+    # scroll_container(container)
+
+    text = page.locator("body").inner_text()
+    lines = text.splitlines()
+
+    # Remove empty lines if you want
+    lines = [line.strip() for line in lines if line.strip()]
+
+    start = lines.index("1-minute views") + 1
+
+    data = lines[start:]
+    today = date.today().isoformat()
+
+    i = 0
+    rows_to_update = []
+    while i < len(data):
+        # Need at least 15 fields for a normal reel
+        if i + 15 > len(data):
+            break
+
+        chunk = data[i:i+15]
+
+        #
+        # Check whether this reel has an Ownership issue
+        #
+
+        if chunk[1] == "Ownership issue":
+
+            # This reel has 16 fields
+            if i + 16 > len(data):
+                break
+
+            chunk = data[i:i+16]
+
+            # Remove the Ownership issue field
+            del chunk[1]
+
+            # We consumed 16 fields
+            i += 16
+
+        else:
+
+            # Normal reel = 15 fields
+            i += 15
+
+
+        #
+        # At this point chunk should ALWAYS contain
+        # exactly 15 fields
+        #
+
+        if len(chunk) != 15:
+            print("Unexpected chunk length:", len(chunk))
+            continue
+
+
+        name, _, publish_time, views, viewers, engagement, revenue, net_follows, impressions, comments, distribution_factor, watch_time, avg_watch_time, three_sec_views, one_min_views = chunk
+
+        if name.count('#') > 0:
+            assert len(name.split('#')[0]) > 0
+
+        reel_data = {
+            "name": name.split('#')[0],
+            "views": int(views.replace(",", "")),
+            "engagement": engagement,
+            "net_follows": int(net_follows.strip().replace(',', '')),
+            "revenue": revenue,
+            "1_minute_views": one_min_views,
+        }
+
+        rows_to_update.append([
+            today,
+            reel_data["name"],
+            reel_data["views"],
+            reel_data["net_follows"],
+            reel_data["engagement"],
+            reel_data["revenue"]
+        ])
+        
+    browser.close()
+    batch_update_rows("reel_performance_12_00_pm.xlsx", rows_to_update)
+    sort_workbook("reel_performance_12_00_pm.xlsx")
+    rebuild_delta_table("reel_performance_12_00_pm.xlsx")
+    build_delta_summary("reel_performance_12_00_pm.xlsx")
+    format_numbers("reel_performance_12_00_pm.xlsx")
+    format_alignment("reel_performance_12_00_pm.xlsx")
+    create_graphs_sheet("reel_performance_12_00_pm.xlsx")
