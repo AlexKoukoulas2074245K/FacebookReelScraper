@@ -238,6 +238,16 @@ def create_graphs_sheet(filename):
         daily_rows = daily_rows[-15:]
 
         # --------------------------------------------------------------
+        # Latest cumulative snapshot for this Reel, straight from the 
+        # raw data sheet. Used to show the running grand total in each
+        # chart title
+        # --------------------------------------------------------------
+        latest_snapshot = sorted (
+            raw_rows,
+            key=lambda r: r["date"]
+        )[-1]
+        
+        # --------------------------------------------------------------
         # Reel name
         # --------------------------------------------------------------
         title_row = graph_row
@@ -290,9 +300,11 @@ def create_graphs_sheet(filename):
         views_chart.type = "col"
         views_chart.visible_cells_only = False
         views_chart.style = 10
-        views_chart.title = "Daily Views"
+        views_chart.title = (
+            f"Daily Views (Lifetime Total: {latest_snapshot['views']:,})"
+        )
         views_chart.y_axis.title = "Views"
-        views_chart.x_axis.title = "Date"
+        views_chart.x_axis.title = "Date (Up to last 15 days)"
         views_chart.height = 7
         views_chart.width = 15
         views_chart.legend = None
@@ -327,9 +339,11 @@ def create_graphs_sheet(filename):
         follows_chart.type = "col"
         follows_chart.visible_cells_only = False
         follows_chart.style = 10
-        follows_chart.title = "Daily Net Follows"
+        follows_chart.title = (
+            f"Daily Net Follows (Lifetime Total: {latest_snapshot['follows']:,})"
+        )
         follows_chart.y_axis.title = "Net Follows"
-        follows_chart.x_axis.title = "Date"
+        follows_chart.x_axis.title = "Date (Up to last 15 days)"
         follows_chart.height = 7
         follows_chart.width = 15
         follows_chart.legend = None
@@ -364,9 +378,11 @@ def create_graphs_sheet(filename):
         revenue_chart.type = "col"
         revenue_chart.visible_cells_only = False
         revenue_chart.style = 10
-        revenue_chart.title = "Daily Revenue"
+        revenue_chart.title = (
+            f"Daily Revnue (Lifetime Total: ${latest_snapshot['revenue']:,.2f})"
+        )
         revenue_chart.y_axis.title = "Revenue"
-        revenue_chart.x_axis.title = "Date"
+        revenue_chart.x_axis.title = "Date (Up to last 15 days)"
         revenue_chart.height = 7
         revenue_chart.width = 15
         revenue_chart.legend = None
