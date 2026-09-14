@@ -1038,15 +1038,28 @@ def find_reels_scroll_container(page, min_overflow=200, min_rows=3):
                 return null;
             }
 
-            const withRows = candidates.filter(c => c.rows >= minRows);
-            const pool = withRows.length ? withRows : candidates;
-
-            // Most rows wins; on a tie take the deepest (innermost) element.
-            pool.sort(
-                (a, b) => (b.rows - a.rows) || (b.depth - a.depth)
+            const maxRows = candidates.reduce(
+                (best, c) => Math.max(best, c.rows), 0
             );
 
-            return pool[0].el;
+            if (maxRows >= minRows) {
+                const threshold = Math.max(minRows, maxRows * 0.8);
+
+                const withRows = candidates.filter(
+                    c => c.rows >= threshold
+                );
+
+                withRows.sort(
+                    (a, b) => (b.depth - a.depth) || (b.rows - a.rows)
+                );
+
+                return withRows[0].el;
+            }
+
+            candidates.sort(
+                (a, b) => (b.overflow - a.overflow) || (b.depth - a.depth)
+            );
+            return candidates[0].el;
         }
         """,
         [ROW_SELECTOR, min_overflow, min_rows],
