@@ -1,4 +1,5 @@
 from playwright.sync_api import sync_playwright
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from pathlib import Path
 from datetime import date, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
@@ -12,7 +13,9 @@ from copy import copy
 
 import random
 import re
+import time
 
+TABLE_MARKER_TEXT = "1-minute views"
 HEADERS = [
     "Date",
     "Reel Name",
@@ -1000,71 +1003,162 @@ def batch_update_rows(filename, rows_to_update):
     wb.save(filename)
 
 
-def find_reels_scroll_container(page):
+ROW_SELECTOR = '[role="row"], [role="listitem"], [role="gridcell"]'
+def find_reels_scroll_container(page, min_overflow=200, min_rows=3):
+    handle = page.evaluate_handle(
+        """
+        ([rowSelector, minOverflow, minRows]) => {
+            const candidates = [];
 
-    elements = page.locator("*")
+            const walk = (node,depth) => {
+                for (const el of node.children) {
+                    const overflowY = getComputedStyle(el).overflowY;
+                    const scrolls = (
+                        overflowY === 'auto' || overflowY === 'scroll' || overflowY === 'overlay'
+                    );
 
-    candidates = []
+                    const overflow = el.scrollHeight - el.clientHeight;
 
-    for i in range(elements.count()):
+                    if (scrolls && overflow > minOverflow && el.clientHeight > 150) {
+                        candidates.push({
+                            el: el,
+                            depth: depth,
+                            overflow: overflow,
+                            rows: el.querySelectorAll(rowSelector).length
+                        });
+                    }
 
-        try:
-            el = elements.nth(i)
+                    walk(el, depth + 1);
+                }
+            };
 
-            dimensions = el.evaluate("""
-            e => ({
-                scrollHeight: e.scrollHeight,
-                clientHeight: e.clientHeight
-            })
-            """)
+            walk(document.body, 0);
 
-            difference = (
-                dimensions["scrollHeight"]
-                - dimensions["clientHeight"]
-            )
+            if (!candidates.length) {
+                return null;
+            }
 
-            if difference > 300:
-                candidates.append(
-                    (difference, el)
-                )
+            const withRows = candidates.filter(c => c.rows >= minRows);
+            const pool = withRows.length ? withRows : candidates;
 
-        except:
-            pass
+            // Most rows wins; on a tie take the deepest (innermost) element.
+            pool.sort(
+                (a, b) => (b.rows - a.rows) || (b.depth - a.depth)
+            );
 
-    candidates.sort(
-        key=lambda x: x[0],
-        reverse=True
+            return pool[0].el;
+        }
+        """,
+        [ROW_SELECTOR, min_overflow, min_rows],
     )
 
-    return candidates[0][1]
+    container = handle.as_element()
 
-def scroll_container(container):
-    previous_height = 0
-    same_count = 0
+    if container is None:
+        return None
+
+    info = container.evaluate(
+        """
+        (e) => ({
+            tag: e.tagName,
+            cls: (e.className || '').toString().slice(0, 60),
+            height: e.scrollHeight,
+            rows: e.querySelectorAll('%s').length
+        })
+        """ % ROW_SELECTOR
+    )
+
+    print(
+        f"[scroll] container = <{info['tag'].lower()} class='{info['cls']}'>"
+        f"height={info['height']} rows={info['rows']}"
+    )
+
+    return container
+
+
+def scroll_container(page, container, idle_seconds=10, poll_ms=500, max_seconds=600)
+    measure = """
+    (e) => ({
+        scrollHeight: e.scrollHeight,
+        scrollTop: e.scrollTop,
+        clientHeight: e.clientHeight,
+        rows: e.querySelectorAll('%s').length,
+        chars: (e.innerText || '').length
+    })
+    """ % ROW_SELECTOR
+
+    started = time.monotonic()
+    last_change = started
+    last_signature = None
 
     while True:
-
-        height = container.evaluate(
-            "(e) => e.scrollHeight"
+        state = container.evaluate(measure)
+        signature = (
+            state["scrollHeight"],
+            state["rows"],
+            state["chars"]
         )
 
-        print("Container height:", height)
+        now = time.monotonic()
 
-        if height == previous_height:
-            same_count += 1
-        else:
-            same_count = 0
+        if signature != last_signature:
+            last_signature = signature
+            last_change = now
 
-        if same_count >= 3:
-            break
+            print(
+                f"[scroll] height={state['scrollHeight']} "
+                f"rows={state['rows']} chars={state['chars']}"
+            )
 
-        container.evaluate(
-            "(e) => e.scrollTop = e.scrollHeight"
+        idle_for = now - last_change
+
+        if idle_for >= idle_seconds:
+            print (
+                f"[scroll] nothing new for {idle_for:.0f}s - "
+                f"done ({state['rows']} rows)"
+            )
+
+            return
+
+        if now - started > max_seconds:
+            print(
+                f"[scroll] gave up after {max_seconds}s - "
+                f"scraping what has loaded so far"
+            )
+
+            return
+
+        moved = container.evaluate(
+            """
+            (e) => {
+                const before = e.scrollTop;
+                e.scrollTop = e.scrollHeight;
+                return e.scrollTop !== before;
+            }
+            """
         )
 
-        page.wait_for_timeout(3000)
+        at_bottom = (
+            state["scrollTop"] + state["clientHeight"] >= state["scrollHeight"] - 2
+        )
 
-        previous_height = height
+        if not moved and not at_bottom:
+            try:
+                container.scroll_info_view_if_needed()
+                box = container.bounding_box()
+
+                if box:
+                    page.mouse.move(
+                        box["x"] + box["width"] / 2,
+                        box["y"] + box["height"] / 2
+                    )
+                    page.mouse.wheel(0, state["clientHeight"])
+
+            except Exception as error:
+                print("[scroll] wheel fallback failed:", error)
+
+        page.wait_for_timeout(poll_ms)
+
 
     
 URL = "https://www.facebook.com/professional_dashboard/content/content_library/?date_range=LIFETIME&filter=PUBLISHED&post_type=ALL_CONTENT&post_types[0]=REELS&post_types[1]=PHOTOS&sort_by=DATE&sorting_method=METRICS_DESCENDING&locale=en_GB"
@@ -1084,14 +1178,28 @@ with sync_playwright() as p:
         headless=False
     )
 
-    page = browser.new_page()
+    page = browser.pages[0] if browser.pages else browser.new_page()
 
-    page.goto(URL)
+    page.goto(URL, wait_until="domcontentloaded")
 
-    input("Press ENTER once you're ready for scraping to begin...")
-    
-    # container = find_reels_scroll_container(page)+ 
-    # scroll_container(container)
+    try:
+        page.wait_for_selector(
+            f"text={TABLE_MARKER_TEXT}",
+            timeout=90000
+        )
+    except PlaywrightTimeoutError:
+        input(
+            "Couldn't find the content table automatically "
+            "(login needed?). Fix it in the browser, then press ENTER..."
+        )
+
+    container = find_reels_scroll_container(page)
+
+    if container is None:
+        print("No inner scroll container found.")
+        input("Scroll to the bottom of the list, then press ENTER...")
+    else:
+        scroll_container(page, container)
 
     text = page.locator("body").inner_text()
     lines = text.splitlines()
@@ -1099,7 +1207,7 @@ with sync_playwright() as p:
     # Remove empty lines if you want
     lines = [line.strip() for line in lines if line.strip()]
 
-    start = lines.index("1-minute views") + 1
+    start = lines.index(TABLE_MARKER_TEXT) + 1
 
     data = lines[start:]
     today = date.today().isoformat()
