@@ -1069,14 +1069,14 @@ def find_reels_scroll_container(page, min_overflow=200, min_rows=3):
     )
 
     print(
-        f"[scroll] container = <{info['tag'].lower()} class='{info['cls']}'>"
+        f"[scroll] container = <{info['tag'].lower()} class='{info['cls']}'> "
         f"height={info['height']} rows={info['rows']}"
     )
 
     return container
 
 
-def scroll_container(page, container, idle_seconds=10, poll_ms=500, max_seconds=600)
+def scroll_container(page, container, idle_seconds=10, poll_ms=500, max_seconds=600):
     measure = """
     (e) => ({
         scrollHeight: e.scrollHeight,
