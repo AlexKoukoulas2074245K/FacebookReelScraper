@@ -9,6 +9,7 @@ from openpyxl.styles import Alignment
 from openpyxl.chart import BarChart, Reference
 from openpyxl.chart.axis import DateAxis
 from openpyxl.styles import Font
+from openpyxl.worksheet.hyperlink import Hyperlink
 from copy import copy
 
 import random
@@ -24,6 +25,8 @@ HEADERS = [
     "Engagement",
     "3-Second Views"
 ]
+GRAPH_LINK_FONT = Font(color="0563C1", underline="single")
+
 
 def format_numbers(filename):
 
@@ -219,7 +222,8 @@ def create_graphs_sheet(filename):
     # ------------------------------------------------------------------
     graph_row = 3
     helper_start_col = 100  # CV
-
+    title_rows = {}
+    
     for reel_index, reel_name in enumerate(sorted(reels.keys())):
 
         raw_rows = reels[reel_name]
@@ -254,7 +258,8 @@ def create_graphs_sheet(filename):
         # Reel name
         # --------------------------------------------------------------
         title_row = graph_row
-
+        title_rows[reel_name] = title_row
+        
         ws.cell(title_row, 1).value = reel_name
         ws.cell(title_row, 1).font = copy(source_ws["A1"].font)
         ws.cell(title_row, 1).alignment = Alignment(
@@ -455,7 +460,42 @@ def create_graphs_sheet(filename):
     # ------------------------------------------------------------------
 
     wb.save(filename)
+    return title_rows
 
+
+def link_reels_to_graphs(filename, title_rows):
+    """
+    Make every Reel Name in the raw sheet a link to that reel's graph block.
+    """
+
+    wb = load_workbook(filename)
+    ws = wb.active
+
+    linked = 0
+
+    for row in range(2, ws.max_row + 1):
+        cell = ws.cell(row, 2)
+        title_row = title_rows.get(cell.value)
+
+        # A reel with only one snapshot has no graph to point at.
+        if title_row is None:
+            continue
+
+        cell.hyperlink = Hyperlink(
+            ref=cell.coordinate,
+            location=f"Graphs!A{title_row}"
+        )
+
+        cell.font = GRAPH_LINK_FONT
+
+        linked += 1
+
+    print(f"Linked {linked} reel names to graphs")
+
+    wb.save(filename)
+
+        
+    
 def build_delta_summary(filename):
 
     wb = load_workbook(filename)
@@ -1298,4 +1338,5 @@ with sync_playwright() as p:
     build_delta_summary("reel_performance_12_00_pm.xlsx")
     format_numbers("reel_performance_12_00_pm.xlsx")
     format_alignment("reel_performance_12_00_pm.xlsx")
-    create_graphs_sheet("reel_performance_12_00_pm.xlsx")
+    title_rows = create_graphs_sheet("reel_performance_12_00_pm.xlsx")
+    link_reels_to_graphs("reel_performance_12_00_pm.xlsx", title_rows)
