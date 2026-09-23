@@ -8,6 +8,7 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment
 from openpyxl.chart import BarChart, Reference
 from openpyxl.chart.axis import DateAxis
+from openpyxl.chart.layout import Layout, ManualLayout
 from openpyxl.styles import Font
 from openpyxl.worksheet.hyperlink import Hyperlink
 from copy import copy
@@ -15,6 +16,7 @@ from copy import copy
 import random
 import re
 import time
+import sys
 
 TABLE_MARKER_TEXT = "1-minute views"
 HEADERS = [
@@ -82,8 +84,14 @@ def sort_workbook(filename):
     #
     rows.sort(
         key=lambda r: (
-            datetime.fromisoformat(str(r[0])),
             r[1]
+        ),
+        reverse=False
+    )
+    
+    rows.sort(
+        key=lambda r: (
+            datetime.fromisoformat(str(r[0]))
         ),
         reverse=True
     )
@@ -114,7 +122,9 @@ def create_graphs_sheet(filename):
 
     ws = wb.create_sheet("Graphs")
     print(f"Creating Graphs")
-     
+
+    ws.column_dimensions['A'].width += 69
+
     # ------------------------------------------------------------------
     # Collect raw cumulative data from the first sheet
     # ------------------------------------------------------------------
@@ -206,6 +216,66 @@ def create_graphs_sheet(filename):
             })
 
         return daily
+
+    def format_chart(chart, y_axis_format="#,##0", major_unit=None):
+        # Make the columns narrower
+        chart.gapWidth = 250
+        chart.overlap = 0
+
+        # Explicitly show axis labels
+        chart.y_axis.tickLblPos = "nextTo"
+        chart.x_axis.tickLblPos = "low"
+
+        # Start Y axis at zero
+        chart.y_axis.scaling.min = 0
+
+        # Explicit number format for Y axis
+        chart.y_axis.numFmt = y_axis_format
+
+        # Optional fixed spacing between Y-axis tick marks
+        if major_unit is not None:
+            chart.y_axis.majorUnit = major_unit
+
+        # Make sure the axis itself isn't suppressed
+        chart.y_axis.delete = False
+        chart.x_axis.delete = False
+
+        chart.y_axis.title = None
+        chart.x_axis.title = None
+
+        # Give the title its own space above the plot area
+        chart.layout = Layout(
+            manualLayout=ManualLayout(
+                x=0.00,
+                y=0.08,
+                w=0.9,
+                h=0.82
+            )
+        )
+
+    def sensible_major_unit(max_value):
+        if max_value <= 10:
+            return 1
+        elif max_value <= 50:
+            return 10
+        elif max_value <= 200:
+            return 50
+        elif max_value <= 1000:
+            return 100
+        elif max_value <= 5000:
+            return 500
+        elif max_value <= 10000:
+            return 1000
+        elif max_value <= 100000:
+            return 10000
+        elif max_value <= 10000000:
+            return 50000
+        else:
+            return 500000
+
+    def sensible_revenue_major_unit(max_value):
+        return max(0.01, max_value/10)
+
 
     # ------------------------------------------------------------------
     # Layout
@@ -311,11 +381,16 @@ def create_graphs_sheet(filename):
         views_chart.title = (
             f"Daily Views (Lifetime Total: {latest_snapshot['views']:,})"
         )
-        views_chart.y_axis.title = "Views"
-        views_chart.x_axis.title = "Date (Up to last 15 days)"
-        views_chart.height = 7
+        views_chart.height = 8
         views_chart.width = 15
         views_chart.legend = None
+
+        max_views = max(r["views"] for r in daily_rows)
+        format_chart(
+            views_chart,
+            y_axis_format="#,##0",
+            major_unit=sensible_major_unit(max_views)
+        )
 
         views_data = Reference(
             ws,
@@ -350,12 +425,16 @@ def create_graphs_sheet(filename):
         follows_chart.title = (
             f"Daily Net Follows (Lifetime Total: {latest_snapshot['follows']:,})"
         )
-        follows_chart.y_axis.title = "Net Follows"
-        follows_chart.x_axis.title = "Date (Up to last 15 days)"
-        follows_chart.height = 7
+        follows_chart.height = 8
         follows_chart.width = 15
         follows_chart.legend = None
-
+        max_net_follows = max(r["follows"] for r in daily_rows)
+        format_chart(
+            follows_chart,
+            y_axis_format="#,##0",
+            major_unit=sensible_major_unit(max_net_follows)
+        )
+        
         follows_data = Reference(
             ws,
             min_col=follows_col,
@@ -387,14 +466,18 @@ def create_graphs_sheet(filename):
         revenue_chart.visible_cells_only = False
         revenue_chart.style = 10
         revenue_chart.title = (
-            f"Daily Revnue (Lifetime Total: ${latest_snapshot['revenue']:,.2f})"
+            f"Daily Revenue (Lifetime Total: ${latest_snapshot['revenue']:,.2f})"
         )
-        revenue_chart.y_axis.title = "Revenue"
-        revenue_chart.x_axis.title = "Date (Up to last 15 days)"
-        revenue_chart.height = 7
+        revenue_chart.height = 8
         revenue_chart.width = 15
         revenue_chart.legend = None
 
+        format_chart(
+            revenue_chart,
+            y_axis_format='$0.00',
+            major_unit=sensible_revenue_major_unit(latest_snapshot['revenue'])
+        )
+        
         revenue_data = Reference(
             ws,
             min_col=revenue_col,
@@ -430,18 +513,18 @@ def create_graphs_sheet(filename):
 
         ws.add_chart(
             follows_chart,
-            f"L{chart_row}"
+            f"C{chart_row}"
         )
 
         ws.add_chart(
             revenue_chart,
-            f"W{chart_row}"
+            f"M{chart_row}"
         )
 
         # --------------------------------------------------------------
         # Leave enough vertical space before the next Reel
         # --------------------------------------------------------------
-        graph_row += 17
+        graph_row += 20
 
     # ------------------------------------------------------------------
     # Hide helper columns
@@ -481,9 +564,11 @@ def link_reels_to_graphs(filename, title_rows):
         if title_row is None:
             continue
 
+        target_row = max(1, title_row + 15)
+
         cell.hyperlink = Hyperlink(
             ref=cell.coordinate,
-            location=f"Graphs!A{title_row}"
+            location=f"Graphs!A{target_row}"
         )
 
         cell.font = GRAPH_LINK_FONT
@@ -1129,7 +1214,7 @@ def find_reels_scroll_container(page, min_overflow=200, min_rows=3):
     return container
 
 
-def scroll_container(page, container, idle_seconds=10, poll_ms=500, max_seconds=600):
+def scroll_container(page, container, idle_seconds=15, poll_ms=500, max_seconds=600):
     measure = """
     (e) => ({
         scrollHeight: e.scrollHeight,
@@ -1143,6 +1228,7 @@ def scroll_container(page, container, idle_seconds=10, poll_ms=500, max_seconds=
     started = time.monotonic()
     last_change = started
     last_signature = None
+    expansion_index = 1
 
     while True:
         state = container.evaluate(measure)
@@ -1159,9 +1245,10 @@ def scroll_container(page, container, idle_seconds=10, poll_ms=500, max_seconds=
             last_change = now
 
             print(
-                f"[scroll] height={state['scrollHeight']} "
+                f"[scroll expansion={expansion_index}] height={state['scrollHeight']} "
                 f"rows={state['rows']} chars={state['chars']}"
             )
+            expansion_index += 1
 
         idle_for = now - last_change
 
@@ -1219,6 +1306,10 @@ today = datetime.now().date()
 noon_time = datetime.combine(today, datetime.strptime("12:00", "%H:%M").time())
 out_of_hours = datetime.now() < noon_time - timedelta(hours=1) or datetime.now() > noon_time + timedelta(hours=1)
 
+manual_mode = False
+if len(sys.argv) > 1 and sys.argv[1].lower() == '--manual':
+    manual_mode = True
+
 if out_of_hours:
     answer = input("More than an hour away from 12:00 pm. Proceed (Y/N)?\n")
     if answer.upper() == "N" or answer.upper() == "NO":
@@ -1250,6 +1341,8 @@ with sync_playwright() as p:
 
     if container is None:
         print("No inner scroll container found.")
+        input("Scroll to the bottom of the list, then press ENTER...")
+    elif manual_mode:
         input("Scroll to the bottom of the list, then press ENTER...")
     else:
         scroll_container(page, container)
